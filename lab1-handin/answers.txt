@@ -1,0 +1,81 @@
+For better viewing, please open in vi as full-screen view.
+***************************************exploit-2a********************************
+Bug used :- Bug#1
+Buffer used:- char buf[4096]
+File:- http.c
+Function:- http_request_line
+***************************************exploit-2b*********************************
+Bug used :- Bug#2
+Buffer used:- char pn[1024]
+File:- http.c
+Function:- http_serve
+
+***************************************Exercise-3**********************************
+Bug#1 --> Shell code injection is possible via exploit-2a.py which exploits Bug#1. Deletes /home/httpd/grades.txt and crashes the server. 
+Request String:-
+req="GET /"+"\xeb\x15\x5e\x31\xc0\x88\x46\x16\xb0\x05\x04\x05\x89\xf3\xcd\x80\x31\xdb\x89\xd8\x40\xcd\x80\xe8\xe6\xff\xff\xff\x2f\x68\x6f\x6d\x65\x2f\x68\x74\x74\x70\x64\x2f\x67\x72\x61\x64\x65\x73\x2e\x74\x78\x74"+" HTTP/1.0"+"\x41"*4044+"\x08\xe6\xff\xbf"+"\x41"*12+"\xc5\xcd\xff\xbf"+"\r\n\r\n";
+
+Bug#2 --> code in exploit-3.py. Deletes /home/httpd/grades.txt and keeps the server running.
+
+Bug#3 --> Yes, Bug#3 is similar to Bug#1, with a difference that exploit string needs to be given after the first occurence of \r\n. Here also we can overwrite the return address of http_request_header with the address of buf, which can be the base address of our shell code.
+
+Bug#4 --> Yes, the vulnerability can be exploited in a similar way as Bug#1.
+Bug#5 --> Yes, can be exploited.
+Bug#6 --> Since for Bug#6 to happen buffer in Bug#1 should overflow, the exploit will be counted as vulnerability of Bug#1.
+
+*****************************************End of part-1A******************************
+
+***************************************Exercise 4*************************************
+exploit-4a.py:- exploited Bug#1 of bugs.txt
+exploit-4b.py:- exploited Bug#2 of bugs.txt
+
+Bug#3:-Yes can be exploited.
+Bug#4:-Yes can be exploited.
+Bug#5:-Yes can be exploited.
+Bug#6:-Since vulnerability caused by Bug#6 is one of the consequences of Bug#1, so we can say, yes it can be exploited in a similar manner.
+
+***************************************Exercise 5*************************************
+1.DoS attack via GET:-
+  The function http_read_line in http.c is written such that, it will stop reading from the socket only after receiving "\r\n". So if I send a string without terminating it with "\r\n", then it will be stuck forever.
+
+String:-
+req = "GET /favicon.ico HTTP/1.1"
+
+ After sending this request string, if we try to telnet to the server, it accepts the connection, but denies the service, until the first request(exploit) gets served, which is never going to happen, until we press Ctrl-Z.
+
+Limitation of the attack:-
+a. The attack works, because in the implementation of the server, the accept() function call is in zookd. So what is happening is that when my zookld is executed, it fires up zookd, which accepts my request for connection. Now when I sent my string without "\r\n", it is stuck in http_read_line() of the zookd executable, hence even a new connection is denied. Had accept() call be placed in zookld before fork()(which is done mostly, when building a concurrent server), then whatever would have been the issue with the first request, my subsequent requests would not have been affected, because the server has allocated them resources (accept()) and then spawned a new process(a zookd of there own), which is independently receiving requests from the client.
+
+b.DoS attacks rely on large numbers of systems to overwhelm the defences of the target. The attack itself can be extremely simple (such as a flood) but we are relying on brute force no volume.
+
+
+Solutions:-
+a. Using a callback function, which gets triggered once the control remains stuck in http_read_line() for a certain threshold amount of time, and sends a "time out" signal and prevents the server from getting stuck.
+
+b. As suggested in limitation 1, making the server more concurrent i.e. by placing the accept() in zookld before fork().
+
+***********************************************************************************************************************
+
+2. Access to sensitive files in /root :-
+   The request string that we send is prefixed by the path "/home/httpd/lab/", but if we send the Request URI as ../../../, on the server it will be read as /home/httpd/lab/../../../ which will bring us inside the root directory. From there the possibilities are endless.
+
+a. We can know about the user accounts by sending a GET request for /etc/passwd. Gaining access to /etc/passwd means he/she can know whether a particular account is password protected or not. Limitation here being he/she wont be able to get access to actual passwords, as they are stored in an encrypted format in /etc/shadow.
+
+req="GET /../../../etc/passwd"+" HTTP/1.0\r\n\r\n"
+
+b. We can send a GET request for .bash_history file and can gain information, about what we have been upto. It is a very serious security breach.
+
+Limitations:-
+a. Even though we can gain access to these sensitive files, but we cannot modify them. For modifying or even renaming we need both write and execute permissions of the directory, which we do not have.
+
+b. Some of the CRUD operations are dependent on other exploitation techniques such as shell code injection or return-to-libc, which are very common and easy to catch.
+
+Solutions:-
+a. If a particular user account, like here httpd is to host a server, the best go-to practice is to restrict the environment or "jail" the environment. This is done by chroot command and only done by the root.
+
+b. We can deny the execute permissions of the sensitive directories to the account which is hosting a server. This can be done via "setfacl"(set file access control lists) command.
+
+
+
+*********************************************************End of answers.txt************************************************
+

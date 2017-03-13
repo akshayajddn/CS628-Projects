@@ -1,0 +1,224 @@
+#
+# [file:#lines]
+# desc
+#
+************************************Bug#1***************************************
+[http.c:66]
+Function:- http_request_line
+Buffer used:- char buf[4096]
+Vulnerability:- Did a buffer overflow with the following req string, such that the return address of the function http_request_line gets overwritten with its own address.
+
+req = "GET /favicon.ico"+" HTTP/1.0"+"\x41"*4083+"\x08\xe6\xff\xbf"+"\x41"*12+"\x68\x91\x04\x08"+"\r\n\r\n"
+
+Offending lines of code:-
+66     if (http_read_line(fd, buf) < 0)
+http_read_line() does not have any check for buffer size. It keeps on reading until it finds \r\n.
+
+Explanation:-
+The structure of the stack will be like this.
+
+{return address to which http_request_line will return}
+{ebp of process_client}
+{envp}
+{qp}
+{sp2}
+{sp1}
+{buf+4096}
+.
+.
+{buf}
+
+So from the stack structure, we can infer that if if we try to overflow buf[], we may overwrite envp, which is pointing to the env[4096] of process_client. So if I dont hardcode and carry on with \x41, then envp will point to "\x41\x41\x41\x41", which will be unaccessible. On the top of that execution of line#87(envp+=...) will lead to SEGMENTATION FAULT. So in this case my server will crash, but not because the return address was overwritten, which dilutes the aim of the exploit. Hence the hardcoded value. The second and last hardcode is the address of the http_request_line.
+
+Result:- control will be stuck inside http_request_line and then the server will crash.
+make check-crash PASSED.
+
+Stack Canary Prevention:- Yes, stack canaries will detect and prevent this vulnerability.
+**********************************Bug#2******************************************************************************
+[http.c:274]
+Function:-http_serve
+Data structure overwritten:- void (*handler)(int, const char *)
+Buffer used:- char pn[1024]
+
+req="GET /"+"\x41"*1012+" HTTP/1.0\r\n\r\n"
+
+Offending lines of code:-
+265 void http_serve(int fd, const char *name)
+266 {
+267     void (*handler)(int, const char *) = http_serve_none;
+268     char pn[1024];
+
+274     strcat(pn, name);
+277     if (!stat(pn, &st))
+288     handler(fd, pn);
+
+
+Explanation:-
+Below code flow depicts how pn[] buffer is getting its value:-
+{String read in buf[] in http_request_line}---->{REQUEST_URI extracted and stored in env[] string}---->{zookd sends env[] string to zookfs via sendfd()}--->{zookfs receives the envp string via recvd() in envp[]}--->{This envp is sent to env_deserialize(), which sets REQUEST_URI to the value after GET /}-->{Then zookfs calls http_serve() in http.c where value of environment variable "REQUEST_URI" is the argument}--->{Hence the portion of the request string, which is after "GET /" becomes pn[]}.
+
+The stack structure will be like:-
+{return address of http_serve()}
+{ebp of main of zookfs}
+{handler}
+{pn+1024}
+.
+.
+{pn}
+
+Nowhere in the code flow(uptill http_serve), we saw a validation of REQUEST_URI, so we can send anything such that it overflows the buffer and overwrites handler. Now in http_serve, the if condition will fail, because requested document (pn[]) does not exist and stat() in line#277 returns -1 for non-existing documents, so !(anything non-zero) will give 0, which is false, which will skip the assigment of function addresses to handler, so our overwritten value remains intact and the exploit works successfully.
+
+RESULT:- crashes the child spawned by zookfs.
+make check-crash PASSED.
+
+Stack Canary Prevention---> Stack canaries are checked only when the function returns, but handler will be invoked before http_serve returns. Hence stack canaries will not be able to prevent this vulnerability.
+****************************************Bug#3******************************************
+[http.c:121]
+Function:-http_request_headers
+Buffer used:- char buf[4096]
+
+req = "GET / HTTP/1.0\r\nAccept: "+"\x41"*4112+"\xdd\x8b\x04\x08"+"\x03\x00\x00\x00"+"\r\n\r\n"
+
+Offending lines of code:-
+108 const char *http_request_headers(int fd)
+109 {
+110     char buf[4096];
+
+119     for (;;)
+120     {
+121         if (http_read_line(fd, buf) < 0)
+
+Explanation:-
+This is similar to Bug#1, but with a difference of the functions. The part of the request string after first \r\n will be received as a header by
+http_request_headers in the process spawned by zookfs. There are no checks performed in http_request_header. We have to ensure only the format which "Field_name: Field_value" and the stack structure will be like:-
+{return address of http_request_header}
+{ebp of main}
+{buf+4096}
+.
+.
+{buf}
+So here we can do multiple things, we can overwrite the return address or change the arguments. I have overwritten the return address with the addressof the main of zookfs(). 
+
+RESULT:- after http_request_headers(), control flow goes to main and then crashes child spawned by zookfs, displaying "Wrong arguments".
+
+Stack Canary Prevention:- Yes. Due to same reason as Bug#1.
+
+***************************************Bug#4************************************************
+[zookd.c:70]
+Funcion:- process_client
+Buffer used:- char env[4096]
+
+req = "GET / "+"\x41"*4051+"\r\n\r\n"
+
+Offending lines of code:-
+ 60 static void process_client(int fd)
+ 61 {
+ 62     char env[4096];
+
+ 70     if ((errmsg = http_request_line(fd, reqpath, sizeof(reqpath), env, &env    _len)))
+
+Explanation:-
+The content in env, will be filled in the function http_request line() by its local pointer in lines#87, 88, 100 and 101(envp+=...). As we can see in the request string, in the request string, there are less than 4096 characters. This is because the above lines(envp+=...) they append strings like "REQUEST_METHOD=" or "SERVICE_PROTOCOL=", due to which in less than 4096 characters, env[] of process_client will overflow and overwrite the socket descriptor argument i.e fd.
+
+RESULT:- crashes the server displaying "Bad file descriptor".
+
+Stack Canary Prevention:- Yes. The canary placed below the return address of process_client() will raise an exception.
+***************************************Bug#5************************************************
+[http.c:304]
+Function used:- http_serve_file
+Buffer used:- char buf[1024]
+
+req="GET /"+"../../../home/httpd/lab/"*41+"favicon.ico/"+"\x41"*134+" HTTP/1.0\r\n\r\n"
+
+Explanation:-
+The flow of the request string will be as follows:-
+{http_request_line() receives and transfers it into env[] of process_client() via envp pointer}------>{process_client then sends env[] to zookfs via sendfd()}--->{zookfs() receives it via recvfd() and then spawns a process}--->{The spawned process goes to http_serve()}--->{In http_serve(), the complete path in pn[] is then sent to split_path()}--->{In split_path()}
+
+Offending lines of code:-
+split_path():-
+     for (;;) {
+198         int r = stat(pn, &st);
+199         if (r < 0) {
+200             if (errno != ENOTDIR && errno != ENOENT)
+201                 break;
+202         } else {
+203             if (S_ISREG(st.st_mode))
+204                 break;
+205         }
+
+210         if (slash)
+211             *slash = '/';
+212         else
+213             slash = pn + strlen(pn);
+214 
+215         while (--slash > pn) {
+216             if (*slash == '/') {
+217                 *slash = '\0';
+218                 break;
+219             }
+220         }
+221 
+222         if (slash == pn) {
+223             slash = NULL;
+224             break;
+225         }
+226     }
+227 
+228     if (slash) {
+229         *slash = '/';
+230         setenv("PATH_INFO", slash, 1);
+231         *slash = '\0';
+232     }
+
+301     if (getenv("PATH_INFO")) {
+302         /* only attempt PATH_INFO on dynamic resources */
+303         char buf[1024];
+304         sprintf(buf, "%s%s", pn, getenv("PATH_INFO"));
+305         http_serve_none(fd, buf);
+306         return;
+307     }
+
+The main challenge in this exploit is to reach line#230 i.e. set the environment variable "PATH_INFO" and we need it because of line #301.For this to happen, I need slash as NOT NULL and != pn, for which I need my infinite loop to break, for which I need:-
+1) a valid filepath
+2) an error which is neither ENOTDIR nor ENOENT
+3) some component of the filepath should itself be a valid file.
+
+Now 1 is not for us, 2 is a bit vague, but 3 is intriguing. It says even though my file is not valid, if I give path like /home/httpd/lab/zookd.c/blahblah, then also it will break with the required conditions (slash!=NULL && slash != pn). This explains the request string.
+
+
+RESULT:- return address of http_serve_file overwritten. The process spawned by zookfs crashes.
+Stack Canary Prevention:- Yes.
+****************************************Bug#6************************************************
+[http.c:98]
+Function:- http_request_line
+Buffer used:-char buf[4096] & char reqpath[2048]
+
+req = "GET /"+"\x41"*4094+" HTTP/1.0"+"\x08\xe6\xff\xbf"+"\x41"*8+"\x18\xf6\xff\xbf"+"\x32\x8f\x04\x08"+"\x05\x00\x00\x00"+"\x04\xde\xff\xbf"+"\x00\x10"+"\r\n\r\n"
+
+Explanation:-
+Stack structure will be as follows:-
+.
+.
+{reqpath_len}
+{reqpath}
+{fd}
+{return address to which http_request_line will return}
+{ebp of process_client}
+{envp}
+{qp}
+{sp2}
+{sp1}
+{buf+4096}
+.
+.
+{buf}
+
+Now here I have used Bug#1, in a way that my exploit string reaches {reqpath_len} without disturbing the stack contents in its way.
+This modifies the reqpath_len, which in turn leads to a buffer overflow of reqpath, in line #98
+98     url_decode(reqpath, sp1, reqpath_len);
+Also the http_read_line() function is indirectly offending.
+
+RESULT:- After http_request_line, the control goes back to process_client, but soon crashes when it tries to send reqpath to zookfs via sendfd.As a result the server crashes.
+
+Stack Canary Prevention:- Yes.
+********************************************End of Bugs.txt******************************************
